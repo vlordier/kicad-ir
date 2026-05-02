@@ -12,6 +12,7 @@ license = "MIT"
 authors = [{ name = "Vincent Lordier" }]
 dependencies = [
   "pydantic>=2.7",
+  "sexpdata>=1.0.2",
 ]
 
 [project.optional-dependencies]
@@ -19,9 +20,13 @@ dev = [
   "pytest>=8.0",
   "ruff>=0.5",
 ]
+full-kicad = [
+  "kicadfiles>=0.2.0",
+]
 
 [project.scripts]
 kicad-ir-route-demo = "kicad_ir.cli:main"
+kicad-ir-route-board = "kicad_ir.cli:route_board_file"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kicad_ir"]
