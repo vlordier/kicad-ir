@@ -6,6 +6,7 @@ from kicad_ir.config import RouterConfig
 from kicad_ir.ir import Board, LayerPoint, Net, Route, TrackSegment, Via
 
 DIRS = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+State = tuple[LayerPoint, tuple[int, int] | None]
 
 
 def heuristic(a: LayerPoint, b: LayerPoint) -> int:
@@ -43,19 +44,35 @@ def build_blocked(board: Board) -> set[LayerPoint]:
     return blocked
 
 
+def build_global_guide(board: Board, config: RouterConfig) -> Counter[tuple[int, int, int]]:
+    guide: Counter[tuple[int, int, int]] = Counter()
+    bin_size = max(1, config.global_bin_size)
+    for cell in build_blocked(board):
+        x, y, layer = cell
+        guide[(x // bin_size, y // bin_size, layer)] += 1
+    return guide
+
+
 def move_cost(
     a: LayerPoint,
     b: LayerPoint,
     net: Net,
     congestion: Counter[LayerPoint],
+    guide: Counter[tuple[int, int, int]],
+    prev_dir: tuple[int, int] | None,
     config: RouterConfig,
 ) -> int:
     c = 1
+    direction = (b[0] - a[0], b[1] - a[1]) if a[2] == b[2] else None
     if a[2] != b[2]:
         c += config.via_penalty
+    elif prev_dir is not None and direction is not None and direction != prev_dir:
+        c += config.turn_penalty
     if net.preferred_layer is not None and b[2] != net.preferred_layer:
         c += config.off_preferred_layer_penalty
     c += config.congestion_weight * congestion[b]
+    bin_size = max(1, config.global_bin_size)
+    c += config.guide_penalty * guide[(b[0] // bin_size, b[1] // bin_size, b[2])]
     return c
 
 
@@ -68,31 +85,37 @@ def astar_3d(
     allowed: set[LayerPoint] | None = None,
     congestion: Counter[LayerPoint] | None = None,
     config: RouterConfig | None = None,
+    guide: Counter[tuple[int, int, int]] | None = None,
 ) -> list[LayerPoint] | None:
     congestion = congestion or Counter()
     config = config or RouterConfig()
-    open_set = [(0, start)]
-    came_from: Dict[LayerPoint, LayerPoint] = {}
-    g = {start: 0}
+    guide = guide or Counter()
+    start_state: State = (start, None)
+    open_set = [(0, start_state)]
+    came_from: Dict[State, State] = {}
+    g = {start_state: 0}
 
     while open_set:
-        _, current = heapq.heappop(open_set)
+        _, current_state = heapq.heappop(open_set)
+        current, prev_dir = current_state
         if current == goal:
             path = []
-            while current in came_from:
-                path.append(current)
-                current = came_from[current]
+            while current_state in came_from:
+                path.append(current_state[0])
+                current_state = came_from[current_state]
             path.append(start)
             return path[::-1]
 
         for nxt in neighbors(current, board):
             if nxt in blocked and (allowed is None or nxt not in allowed):
                 continue
-            tentative = g[current] + move_cost(current, nxt, net, congestion, config)
-            if tentative < g.get(nxt, 1_000_000_000):
-                came_from[nxt] = current
-                g[nxt] = tentative
-                heapq.heappush(open_set, (tentative + heuristic(nxt, goal), nxt))
+            direction = (nxt[0] - current[0], nxt[1] - current[1]) if nxt[2] == current[2] else prev_dir
+            nxt_state: State = (nxt, direction)
+            tentative = g[current_state] + move_cost(current, nxt, net, congestion, guide, prev_dir, config)
+            if tentative < g.get(nxt_state, 1_000_000_000):
+                came_from[nxt_state] = current_state
+                g[nxt_state] = tentative
+                heapq.heappush(open_set, (tentative + heuristic(nxt, goal), nxt_state))
     return None
 
 
@@ -106,15 +129,7 @@ def path_to_route(path: list[LayerPoint], net: Net) -> Route:
     def flush_segment() -> None:
         nonlocal current_start, previous, previous_dir
         if current_start is not None and previous is not None and current_start != previous:
-            segments.append(
-                TrackSegment(
-                    net=net.id,
-                    layer=current_start[2],
-                    start=(current_start[0], current_start[1]),
-                    end=(previous[0], previous[1]),
-                    width=net.width,
-                )
-            )
+            segments.append(TrackSegment(net=net.id, layer=current_start[2], start=(current_start[0], current_start[1]), end=(previous[0], previous[1]), width=net.width))
         current_start = None
         previous = None
         previous_dir = None
@@ -155,17 +170,10 @@ def _net_difficulty(board: Board, net: Net) -> int:
     return len(pts) * 1000 + (max(xs) - min(xs)) + (max(ys) - min(ys))
 
 
-def _route_single_net(
-    board: Board,
-    net: Net,
-    blocked: set[LayerPoint],
-    congestion: Counter[LayerPoint],
-    config: RouterConfig,
-) -> Route | None:
+def _route_single_net(board: Board, net: Net, blocked: set[LayerPoint], congestion: Counter[LayerPoint], config: RouterConfig, guide: Counter[tuple[int, int, int]]) -> Route | None:
     own_pad_cells: set[LayerPoint] = set()
     for pad_id in net.pads:
         own_pad_cells |= board.pads_by_id[pad_id].occupied_cells(board.layer_ids)
-
     full_path: list[LayerPoint] = []
     remaining = list(net.pads[1:])
     current = net.pads[0]
@@ -173,7 +181,7 @@ def _route_single_net(
         start = _pad_layer_point(board, current, net)
         next_pad = min(remaining, key=lambda pid: heuristic(start, _pad_layer_point(board, pid, net)))
         goal = _pad_layer_point(board, next_pad, net)
-        path = astar_3d(start, goal, board, net, blocked, own_pad_cells, congestion, config)
+        path = astar_3d(start, goal, board, net, blocked, own_pad_cells, congestion, config, guide)
         if not path:
             return None
         full_path.extend(path if not full_path else path[1:])
@@ -182,20 +190,16 @@ def _route_single_net(
     return path_to_route(full_path, net)
 
 
-def _route_pass(
-    board: Board,
-    order: list[Net],
-    congestion: Counter[LayerPoint],
-    config: RouterConfig,
-) -> tuple[list[Route], list[str], Counter[LayerPoint]]:
+def _route_pass(board: Board, order: list[Net], congestion: Counter[LayerPoint], config: RouterConfig) -> tuple[list[Route], list[str], Counter[LayerPoint]]:
     blocked = build_blocked(board)
+    guide = build_global_guide(board, config)
     routes: list[Route] = []
     failed: list[str] = []
     new_congestion: Counter[LayerPoint] = Counter()
     for net in order:
         if len(net.pads) < 2:
             continue
-        route = _route_single_net(board, net, blocked, congestion, config)
+        route = _route_single_net(board, net, blocked, congestion, config, guide)
         if route is None:
             failed.append(net.id)
             continue
@@ -212,7 +216,6 @@ def route_board(board: Board, config: RouterConfig | None = None) -> tuple[list[
     congestion: Counter[LayerPoint] = Counter()
     best_routes: list[Route] = []
     best_failed = [n.id for n in base_order if len(n.pads) >= 2]
-
     for _ in range(config.max_passes):
         failed_set = set(best_failed)
         order = sorted(base_order, key=lambda n: (n.id not in failed_set, -_net_difficulty(board, n)))
