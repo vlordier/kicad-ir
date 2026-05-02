@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from kicad_ir.exporter import segments_to_kicad
+from kicad_ir.exporter import segments_to_kicad, write_routed_board
 from kicad_ir.ir import Board, Layer, Net, Pad
 from kicad_ir.parser import parse_kicad_pcb
 from kicad_ir.router import route_board
@@ -47,9 +47,10 @@ def main() -> None:
 
 
 def route_board_file() -> None:
-    parser = argparse.ArgumentParser(description="Route a KiCad board into a KiCad snippet file")
-    parser.add_argument("input", type=Path, help="Input .kicad_pcb file")
-    parser.add_argument("--out", type=Path, default=None, help="Output snippet file")
+    parser = argparse.ArgumentParser(description="Route a KiCad board")
+    parser.add_argument("input", type=Path)
+    parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--in-place", action="store_true")
     args = parser.parse_args()
 
     board = parse_kicad_pcb(str(args.input))
@@ -58,10 +59,16 @@ def route_board_file() -> None:
     net_map = {net.id: net.kicad_net_code for net in board.nets}
     snippet = segments_to_kicad(board, tracks, net_map)
 
-    out = args.out or args.input.with_suffix(".routed.kicad-snippet")
-    out.write_text(snippet + "\n", encoding="utf-8")
+    if args.in_place:
+        backup = args.input.with_suffix(".bak.kicad_pcb")
+        backup.write_text(args.input.read_text(encoding="utf-8"), encoding="utf-8")
+        write_routed_board(args.input, args.input, snippet)
+        print(f"updated {args.input} (backup at {backup})")
+    else:
+        out = args.out or args.input.with_suffix(".routed.kicad_pcb")
+        write_routed_board(args.input, out, snippet)
+        print(f"wrote {out}")
 
-    print(f"wrote {out}")
     print(f"routes={len(routes)} tracks={len(tracks)} failed={len(failed)}")
     if failed:
         print("failed nets:")
@@ -70,4 +77,4 @@ def route_board_file() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    route_board_file()
