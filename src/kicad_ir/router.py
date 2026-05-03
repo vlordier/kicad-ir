@@ -1,5 +1,5 @@
 import heapq
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import Dict, Iterable
 
 from kicad_ir.config import RouterConfig
@@ -53,15 +53,7 @@ def build_global_guide(board: Board, config: RouterConfig) -> Counter[tuple[int,
     return guide
 
 
-def move_cost(
-    a: LayerPoint,
-    b: LayerPoint,
-    net: Net,
-    congestion: Counter[LayerPoint],
-    guide: Counter[tuple[int, int, int]],
-    prev_dir: tuple[int, int] | None,
-    config: RouterConfig,
-) -> int:
+def move_cost(a: LayerPoint, b: LayerPoint, net: Net, congestion: Counter[LayerPoint], guide: Counter[tuple[int, int, int]], prev_dir: tuple[int, int] | None, config: RouterConfig) -> int:
     c = 1
     direction = (b[0] - a[0], b[1] - a[1]) if a[2] == b[2] else None
     if a[2] != b[2]:
@@ -76,17 +68,7 @@ def move_cost(
     return c
 
 
-def astar_3d(
-    start: LayerPoint,
-    goal: LayerPoint,
-    board: Board,
-    net: Net,
-    blocked: set[LayerPoint],
-    allowed: set[LayerPoint] | None = None,
-    congestion: Counter[LayerPoint] | None = None,
-    config: RouterConfig | None = None,
-    guide: Counter[tuple[int, int, int]] | None = None,
-) -> list[LayerPoint] | None:
+def astar_3d(start: LayerPoint, goal: LayerPoint, board: Board, net: Net, blocked: set[LayerPoint], allowed: set[LayerPoint] | None = None, congestion: Counter[LayerPoint] | None = None, config: RouterConfig | None = None, guide: Counter[tuple[int, int, int]] | None = None) -> list[LayerPoint] | None:
     congestion = congestion or Counter()
     config = config or RouterConfig()
     guide = guide or Counter()
@@ -94,7 +76,6 @@ def astar_3d(
     open_set = [(0, start_state)]
     came_from: Dict[State, State] = {}
     g = {start_state: 0}
-
     while open_set:
         _, current_state = heapq.heappop(open_set)
         current, prev_dir = current_state
@@ -105,7 +86,6 @@ def astar_3d(
                 current_state = came_from[current_state]
             path.append(start)
             return path[::-1]
-
         for nxt in neighbors(current, board):
             if nxt in blocked and (allowed is None or nxt not in allowed):
                 continue
@@ -125,7 +105,6 @@ def path_to_route(path: list[LayerPoint], net: Net) -> Route:
     current_start: LayerPoint | None = None
     previous: LayerPoint | None = None
     previous_dir: tuple[int, int] | None = None
-
     def flush_segment() -> None:
         nonlocal current_start, previous, previous_dir
         if current_start is not None and previous is not None and current_start != previous:
@@ -133,7 +112,6 @@ def path_to_route(path: list[LayerPoint], net: Net) -> Route:
         current_start = None
         previous = None
         previous_dir = None
-
     for a, b in zip(path[:-1], path[1:]):
         if a[2] != b[2]:
             flush_segment()
@@ -190,24 +168,40 @@ def _route_single_net(board: Board, net: Net, blocked: set[LayerPoint], congesti
     return path_to_route(full_path, net)
 
 
+def _reserve(route: Route, board: Board, net: Net) -> set[LayerPoint]:
+    return inflate(route.path, net.clearance, board)
+
+
 def _route_pass(board: Board, order: list[Net], congestion: Counter[LayerPoint], config: RouterConfig) -> tuple[list[Route], list[str], Counter[LayerPoint]]:
-    blocked = build_blocked(board)
+    static_blocked = build_blocked(board)
     guide = build_global_guide(board, config)
-    routes: list[Route] = []
+    route_by_net: dict[str, Route] = {}
+    owner: dict[LayerPoint, str] = {}
     failed: list[str] = []
-    new_congestion: Counter[LayerPoint] = Counter()
     for net in order:
         if len(net.pads) < 2:
             continue
+        blocked = static_blocked | set(owner)
         route = _route_single_net(board, net, blocked, congestion, config, guide)
         if route is None:
-            failed.append(net.id)
-            continue
-        routes.append(route)
-        reserved = inflate(route.path, net.clearance, board)
-        blocked |= reserved
-        new_congestion.update(reserved)
-    return routes, failed, new_congestion
+            blockers = Counter(owner[cell] for cell in congestion if owner.get(cell))
+            rip = [n for n, _ in blockers.most_common(2) if n != net.id]
+            for rip_net in rip:
+                old = route_by_net.pop(rip_net, None)
+                if old:
+                    rip_cells = _reserve(old, board, board.nets_by_id[rip_net])
+                    for cell in rip_cells:
+                        owner.pop(cell, None)
+            blocked = static_blocked | set(owner)
+            route = _route_single_net(board, net, blocked, congestion, config, guide)
+            if route is None:
+                failed.append(net.id)
+                continue
+        route_by_net[net.id] = route
+        for cell in _reserve(route, board, net):
+            owner[cell] = net.id
+    new_congestion: Counter[LayerPoint] = Counter(owner)
+    return list(route_by_net.values()), failed, new_congestion
 
 
 def route_board(board: Board, config: RouterConfig | None = None) -> tuple[list[Route], list[str]]:
