@@ -20,6 +20,27 @@ def segments_to_kicad(board, tracks, net_map, layer_map=None):
     return "\n".join(lines)
 
 
+def vias_to_kicad(board, vias, net_map):
+    lines = []
+    for via in vias:
+        x, y = board.grid_to_mm((via.x, via.y))
+        size = via.diameter * board.grid_mm
+        drill = via.drill * board.grid_mm
+        net_code = net_map.get(via.net) or 0
+        lines.append(
+            f"(via (at {_fmt(x)} {_fmt(y)}) (size {_fmt(size)}) (drill {_fmt(drill)}) (layers F.Cu B.Cu) (net {net_code}))"
+        )
+    return "\n".join(lines)
+
+
+def routes_to_kicad(board, tracks, vias, net_map, layer_map=None):
+    parts = [segments_to_kicad(board, tracks, net_map, layer_map)]
+    via_text = vias_to_kicad(board, vias, net_map)
+    if via_text:
+        parts.append(via_text)
+    return "\n".join(part for part in parts if part)
+
+
 def insert_snippet_before_final_paren(board_text: str, snippet: str) -> str:
     stripped = board_text.rstrip()
     idx = stripped.rfind(")")
