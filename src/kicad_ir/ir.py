@@ -1,39 +1,54 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Iterable
+from typing import Iterable, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
 Point2D = tuple[int, int]
 LayerPoint = tuple[int, int, int]
+PadShape = Literal["circle", "oval", "rect", "roundrect", "custom", "unknown"]
 
 
 class Layer(BaseModel):
-    """A routable copper layer in the lossy routing IR."""
-
     id: int
     name: str
 
 
-class Pad(BaseModel):
-    """Simplified pad geometry projected to a routing grid."""
+class NetClass(BaseModel):
+    name: str
+    width: int = 1
+    clearance: int = 1
+    via_diameter: int = 2
+    via_drill: int = 1
 
+
+class Pad(BaseModel):
     id: str
     net: str
     x: int
     y: int
-    layer: int | None = None  # None means all copper layers.
+    layer: int | None = None
     radius: int = 1
+    half_width: int | None = None
+    half_height: int | None = None
+    shape: PadShape = "unknown"
     footprint_ref: str | None = None
     pad_name: str | None = None
 
     def occupied_cells(self, layers: Iterable[int]) -> set[LayerPoint]:
         target_layers = list(layers) if self.layer is None else [self.layer]
+        rx = self.half_width if self.half_width is not None else self.radius
+        ry = self.half_height if self.half_height is not None else self.radius
         cells: set[LayerPoint] = set()
         for layer in target_layers:
-            for dx in range(-self.radius, self.radius + 1):
-                for dy in range(-self.radius, self.radius + 1):
+            for dx in range(-rx, rx + 1):
+                for dy in range(-ry, ry + 1):
+                    if self.shape in {"circle", "oval"}:
+                        nx = dx / max(rx, 1)
+                        ny = dy / max(ry, 1)
+                        if nx * nx + ny * ny > 1.0:
+                            continue
                     cells.add((self.x + dx, self.y + dy, layer))
         return cells
 
@@ -45,6 +60,7 @@ class Net(BaseModel):
     clearance: int = 1
     preferred_layer: int | None = None
     kicad_net_code: int | None = None
+    netclass: str | None = None
 
 
 class Obstacle(BaseModel):
@@ -65,12 +81,7 @@ class Obstacle(BaseModel):
 
     def occupied_cells(self, board_layers: Iterable[int]) -> set[LayerPoint]:
         target_layers = self.layers or list(board_layers)
-        return {
-            (x, y, layer)
-            for layer in target_layers
-            for x in range(self.x0, self.x1 + 1)
-            for y in range(self.y0, self.y1 + 1)
-        }
+        return {(x, y, layer) for layer in target_layers for x in range(self.x0, self.x1 + 1) for y in range(self.y0, self.y1 + 1)}
 
 
 class Via(BaseModel):
@@ -104,6 +115,7 @@ class Board(BaseModel):
     layers: list[Layer] = Field(default_factory=lambda: [Layer(id=0, name="F.Cu")])
     pads: list[Pad]
     nets: list[Net]
+    netclasses: list[NetClass] = Field(default_factory=list)
     obstacles: list[Obstacle] = Field(default_factory=list)
     grid_mm: float = 0.25
     origin_x_mm: float = 0.0
@@ -132,17 +144,15 @@ class Board(BaseModel):
     def nets_by_id(self) -> dict[str, Net]:
         return {net.id: net for net in self.nets}
 
+    @property
+    def netclasses_by_name(self) -> dict[str, NetClass]:
+        return {netclass.name: netclass for netclass in self.netclasses}
+
     def grid_to_mm(self, point: Point2D) -> tuple[float, float]:
-        return (
-            self.origin_x_mm + point[0] * self.grid_mm,
-            self.origin_y_mm + point[1] * self.grid_mm,
-        )
+        return (self.origin_x_mm + point[0] * self.grid_mm, self.origin_y_mm + point[1] * self.grid_mm)
 
     def mm_to_grid(self, x_mm: float, y_mm: float) -> Point2D:
-        return (
-            round((x_mm - self.origin_x_mm) / self.grid_mm),
-            round((y_mm - self.origin_y_mm) / self.grid_mm),
-        )
+        return (round((x_mm - self.origin_x_mm) / self.grid_mm), round((y_mm - self.origin_y_mm) / self.grid_mm))
 
 
 class RouteStatus(str, Enum):
