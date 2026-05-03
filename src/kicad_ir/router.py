@@ -1,5 +1,5 @@
 import heapq
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Dict, Iterable
 
 from kicad_ir.config import RouterConfig
@@ -22,6 +22,10 @@ def inflate(points: Iterable[LayerPoint], clearance: int, board: Board) -> set[L
                 if 0 <= nx < board.width and 0 <= ny < board.height:
                     out.add((nx, ny, layer))
     return out
+
+
+def route_clearance_radius(net: Net) -> int:
+    return max(0, net.clearance) + max(0, net.width // 2)
 
 
 def neighbors(p: LayerPoint, board: Board) -> Iterable[LayerPoint]:
@@ -115,7 +119,7 @@ def path_to_route(path: list[LayerPoint], net: Net) -> Route:
     for a, b in zip(path[:-1], path[1:]):
         if a[2] != b[2]:
             flush_segment()
-            vias.append(Via(x=a[0], y=a[1], from_layer=a[2], to_layer=b[2], net=net.id))
+            vias.append(Via(x=a[0], y=a[1], from_layer=a[2], to_layer=b[2], net=net.id, diameter=max(2, net.width + 1), drill=max(1, net.width // 2)))
             continue
         direction = (b[0] - a[0], b[1] - a[1])
         if current_start is None:
@@ -145,7 +149,7 @@ def _net_difficulty(board: Board, net: Net) -> int:
         return 0
     xs = [p.x for p in pts]
     ys = [p.y for p in pts]
-    return len(pts) * 1000 + (max(xs) - min(xs)) + (max(ys) - min(ys))
+    return len(pts) * 1000 + (max(xs) - min(xs)) + (max(ys) - min(ys)) + net.width * 100
 
 
 def _route_single_net(board: Board, net: Net, blocked: set[LayerPoint], congestion: Counter[LayerPoint], config: RouterConfig, guide: Counter[tuple[int, int, int]]) -> Route | None:
@@ -169,7 +173,7 @@ def _route_single_net(board: Board, net: Net, blocked: set[LayerPoint], congesti
 
 
 def _reserve(route: Route, board: Board, net: Net) -> set[LayerPoint]:
-    return inflate(route.path, net.clearance, board)
+    return inflate(route.path, route_clearance_radius(net), board)
 
 
 def _route_pass(board: Board, order: list[Net], congestion: Counter[LayerPoint], config: RouterConfig) -> tuple[list[Route], list[str], Counter[LayerPoint]]:
